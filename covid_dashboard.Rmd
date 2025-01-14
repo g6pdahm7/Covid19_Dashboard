@@ -1,0 +1,525 @@
+---
+title: "COVID-19 Data"
+author: "Team Unison"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+    theme: united
+    logo: logo.png
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+
+# import libraries
+library(tidyverse)
+library(wbstats)
+library(lubridate)
+library(corrplot)
+library(ggsignif)
+
+library(sf)
+library(rnaturalearth)
+library(leaflet)
+
+library(DT)
+
+# import case/death data from WHO
+case_data <- read.csv("WHO-COVID-19-global-data.csv")
+summary(case_data)
+
+# format dates appropriately
+case_data$Date_reported <- ymd(case_data$Date_reported)
+summary(case_data)
+
+#' make only row per country
+#' we are assuming the cumulative case/death counts do not decrease over time,
+#' so the max value will corresond to the most recent observation in the 2020-2022 range
+case_data <- case_data %>%
+  filter(!Date_reported > mdy("12-31-2022")) %>%
+  select(c(Country_code, Country, Cumulative_cases, Cumulative_deaths)) %>% 
+  group_by(Country_code) %>% 
+  summarise(total_cases = max(Cumulative_cases), total_deaths = max(Cumulative_deaths))
+
+# import world bank data corresponding to total population of each country
+pop_data <- wb_data("SP.POP.TOTL", start_date = 2020, end_date = 2022)
+
+# get the average population for each country within the 3 year period
+pop_data <- pop_data %>% 
+  group_by(iso2c) %>% 
+  summarise(country = country[1], population = mean(SP.POP.TOTL, na.rm = T))
+
+# join the case/death data with the population data
+joined_data <- pop_data %>% 
+  left_join(case_data, by = c("iso2c" = "Country_code"))
+
+# calculate cases per 100K and deaths per 100K
+joined_data <- joined_data %>% 
+  mutate(cases_per_100K = (total_cases/population)*100000) %>% 
+  mutate(deaths_per_100K = (total_deaths/population)*100000)
+```
+
+Home
+=======================================================================
+
+Column
+-----------------------------------------------------------------------
+
+```{r, include=FALSE}
+# create map figure with cases per 100K and deaths per 100K for each country
+
+# get world map object
+map <- ne_countries(returnclass = "sf")
+
+# rename columns for ease of use
+names(map)[names(map) == "iso_a2"] <- "ISO2"
+names(map)[names(map) == "name"] <- "NAME"
+
+# manually add country codes for 2 of the countries that have missing codes
+map$ISO2[map$iso_a3_eh == "NOR"] <- "NO"
+map$ISO2[map$iso_a3_eh == "FRA"] <- "FR"
+
+# add cases and deaths variables to the map object (join based on 2 letter country code)
+map$cases_per_100K <- joined_data[match(map$ISO2, joined_data$iso2c), ]$cases_per_100K
+map$deaths_per_100K <- joined_data[match(map$ISO2, joined_data$iso2c), ]$deaths_per_100K
+```
+
+### World Map
+
+```{r}
+# create colour palette to colour code countries based on number of cases per 100K
+pal <- colorBin(
+  palette = "viridis", domain = map$cases_per_100K,
+  bins = seq(0, 80000, by = 10000)
+)
+
+#' when hovering mouse over a country, show a label with the number of cases and
+#' deaths per 100K
+map$labels <- paste0(
+  "<strong> Country: </strong> ",
+  map$NAME, "<br/> ",
+  "<strong> Cases per 100K People: </strong> ",
+  round(map$cases_per_100K, 0), "<br/> ",
+  "<strong> Deaths per 100K People: </strong> ",
+  round(map$deaths_per_100K, 0), "<br/> "
+) %>%
+  lapply(htmltools::HTML)
+
+# create the map figure with a legend to explain the colour code
+leaflet(map) %>%
+  addTiles() %>%
+  setView(lng = 0, lat = 30, zoom = 2) %>%
+  addPolygons(
+    fillColor = ~ pal(cases_per_100K),
+    color = "white",
+    fillOpacity = 0.7,
+    label = ~labels,
+    highlight = highlightOptions(
+      color = "black",
+      bringToFront = TRUE
+    )
+  ) %>%
+  leaflet::addLegend(
+    pal = pal, values = ~cases_per_100K,
+    opacity = 0.7, title = "COVID-19 Cases Globally"
+  )
+```
+
+Column {.tabset}
+-----------------------------------------------------------------------
+
+```{r, include=FALSE}
+# determine the 10 countries with the highest cases per 100K population
+joined_data %>% 
+  arrange(desc(cases_per_100K)) %>% 
+  head(n = 10)
+
+# pick three countries: Austria, France, Denmark
+
+# determine the countries with fewer than 10K cases per 100K population
+joined_data %>% 
+  filter(cases_per_100K < 10000)
+
+# pick three countries: Angola, Chad, Somalia
+
+# determine the 10 countries with the highest deaths per 100K population
+joined_data %>% 
+  arrange(desc(deaths_per_100K)) %>% 
+  head(n = 10)
+
+# pick three countries: Slovenia, Peru, Qatar
+
+# determine the countries with fewer than 250 deaths per 100K population
+joined_data %>% 
+  filter(deaths_per_100K < 250)
+
+# pick three countries: Austria, France, Croatia
+
+#' OUR 10 COUNTRIES (12 but 2 are overlapping):
+#' Austria
+#' France
+#' Denmark
+#' Angola
+#' Chad
+#' Somalia
+#' Slovenia
+#' Peru
+#' Qatar
+#' Croatia
+
+countries <- c("Austria", "France", "Denmark", "Angola", "Chad", "Somalia", "Croatia", "Slovenia", "Peru", "Qatar")
+
+# new dataframe with only the selected countries and cfr calculated per 1000 cases
+d <- joined_data %>% 
+  filter(country %in% countries) %>% 
+  mutate(cfr = (total_deaths/total_cases)*1000)
+
+# get world bank data for GNI, UHC, and population density indicators
+
+# codes for selected indicators:
+# GNI (per capita) - NY.GNP.PCAP.CD
+# Universal healthcare coverage index - SH.UHC.SRVS.CV.XD
+# Population density - EN.POP.DNST
+indicator_codes <- c("NY.GNP.PCAP.CD", "SH.UHC.SRVS.CV.XD", "EN.POP.DNST")
+  
+# create data frame with indicator data from world bank
+indicator_data <- wb_data(indicator_codes, start_date = 2020, end_date = 2022)
+
+indicator_data <- indicator_data %>%
+  group_by(iso2c) %>% 
+  summarise(gni.pc = mean(NY.GNP.PCAP.CD, na.rm = T),
+            uhc = mean(SH.UHC.SRVS.CV.XD, na.rm = T),
+            pd = mean(EN.POP.DNST, na.rm = T))
+
+# join with cfr dataframe containing only countries of interest
+d <- d %>% 
+  left_join(indicator_data, by = c("iso2c" = "iso2c"))
+```
+
+### Cases
+
+```{r}
+# create bar graph showing number of cases per 100K population
+cases_100_fig <- ggplot(d, aes(x = reorder(country, cases_per_100K), y = cases_per_100K, fill = cases_per_100K)) +
+  geom_col() +
+  scale_y_continuous(limits = c(0, 80000)) +
+  scale_fill_gradient(low = "green", high = "red") +
+  coord_flip() +
+  geom_text(aes(label = round(cases_per_100K, 0)), vjust = 0.5, hjust = -0.1, size = 3) +
+  labs(x = "Country", y = "Cases per 100K People", title = "Number of COVID-19 Cases in Selected Countries") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5),
+        legend.position = "none")
+
+# display figure
+cases_100_fig
+```
+
+### Deaths
+
+```{r}
+# create bar graph showing number of deaths per 100K population
+deaths_100_fig <- ggplot(d, aes(x = reorder(country, deaths_per_100K), y = deaths_per_100K, fill = deaths_per_100K)) +
+  geom_col() +
+  scale_y_continuous(limits = c(0, 700)) +
+  scale_fill_gradient(low = "green", high = "red") +
+  coord_flip() +
+  geom_text(aes(label = round(deaths_per_100K, 0)), vjust = 0.5, hjust = -0.1, size = 3) +
+  labs(x = "Country", y = "Deaths per 100K People", title = "Number of COVID-19 Deaths in Selected Countries") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5),
+        legend.position = "none")
+
+# display figure
+deaths_100_fig
+```
+
+### Case Fatality Rate
+
+```{r}
+# create bar graph showing case fatality rate (per 1000 cases)
+cfr_1000_fig <- ggplot(d, aes(x = reorder(country, cfr), y = cfr, fill = cfr)) +
+  geom_col() +
+  scale_y_continuous(limits = c(0, 60)) +
+  scale_fill_gradient(low = "green", high = "red") +
+  coord_flip() +
+  geom_text(aes(label = round(cfr, 0)), vjust = 0.5, hjust = -0.1, size = 3) +
+  labs(x = "Country", y = "Fatalities per 1000 Cases", title = "COVID-19 Case Fatality Rates in Selected Countries") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5),
+        legend.position = "none")
+
+# display figure
+cfr_1000_fig
+```
+
+Socioeconomic Indicators
+=======================================================================
+
+Column {.tabset}
+-----------------------------------------------------------------------
+
+### Healthcare Access
+
+```{r}
+# create bar graph showing Universal Health Coverage Index in Selected Countries 
+uhc_fig <- ggplot(d, aes(x = reorder(country, uhc), y = uhc, fill = uhc)) +
+  geom_col() +
+  scale_y_continuous(limits = c(0, 100), breaks = seq(0, 100, by = 20)) +
+  scale_fill_gradient(
+    low = "red", 
+    high = "green", 
+    name = "UHC Index",
+    breaks = c(min(d$uhc), max(d$uhc)),
+    labels = c("Low", "High")) +
+  coord_flip() +
+  geom_text(aes(label = round(uhc, 1)), hjust = -0.1, size = 3, color = "black") +
+  labs(
+    x = "Country", 
+    y = "Universal Health Coverage Index", 
+    title = "Universal Health Coverage Index in Selected Countries") +
+  theme_classic() +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(hjust = 0.5),
+    axis.text.y = element_text(size = 10))
+
+# display figure
+uhc_fig
+
+```
+
+
+### Population Density
+
+```{r}
+# sort countries according to their population density levels
+d_pd <- d %>% 
+  mutate(pd.category = case_when(
+    pd < 50 ~ "Low Density",
+    pd >= 50 & pd < 150 ~ "Moderate Density",
+    pd >= 150 & pd < 300 ~ "High Density",
+    pd >= 300 ~ "Very High Density"
+  ))
+
+#' create a bar graph showing the population density of each of the 10 countries
+#' color code according to the density categories
+pd_fig <- ggplot(d_pd, aes(x = reorder(country, pd), y = pd, fill = factor(pd.category, levels = c("Very High Density", "High Density", "Moderate Density", "Low Density")))) +
+  geom_col() +
+  scale_y_continuous(limits = c(0, max(d_pd$pd, na.rm = TRUE) * 1.1)) + 
+  coord_flip() +
+  geom_text(aes(label = round(pd, 0)), vjust = 0.5, hjust = -0.1, size = 3) +
+  labs(x = "Country", y = "Population Density (People per sq. km)", title = "Population Density of Selected Countries", fill = "Density Category") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# display figure
+pd_fig
+```
+
+### Income
+
+```{r}
+# sort countries according to their GNI per capita
+d_gni <- d %>% 
+  mutate(gni.category = ifelse(gni.pc <= 1145, "Low Income",
+                               ifelse(gni.pc <= 4515, "Lower Middle Income",
+                                      ifelse(gni.pc <= 14005, "Upper Middle Income", "High Income"))))
+
+#' create a bar graph showing the GNI per capita of each of the 10 countries
+#' color code according to world bank categories
+gni_fig <- ggplot(d_gni, aes(x = reorder(country, gni.pc), y = gni.pc, fill = gni.category)) +
+  geom_col() +
+  scale_y_continuous(limits = c(0, 80000)) +
+  coord_flip() +
+  geom_text(aes(label = round(gni.pc, 0)), vjust = 0.5, hjust = -0.1, size = 3) +
+  labs(x = "Country", y = "GNI per Capita (USD)", title = "GNI of Selected Countries", fill = "GNI Category") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5))
+
+# display figure
+gni_fig
+```
+
+Column {data-width=400}
+-----------------------------------------------------------------------
+
+```{r, include=FALSE}
+# create a correlation plot to help explore which of three indicators are most relevant
+
+# create the correlation matrix, but exclude non-numeric columns
+cor_matrix <- cor(d[,-c(1,2)])
+
+# create a subset of the matrix with only the relevant rows and columns
+subset_cor_matrix <- cor_matrix[c("cases_per_100K", "deaths_per_100K", "cfr"), c("gni.pc","uhc","pd")]
+
+```
+
+### Correlations
+
+```{r}
+# create the correlation plot
+corrplot(subset_cor_matrix, method = "square",
+         title = "Correlation Coefficients of Socioeconomic Indicators\n with Epidemiological Indicators",
+         mar = c(1,1,3,1), cl.pos = "b", cl.ratio = 0.7, cl.cex = 0.7, cl.length = 3, tl.col = "black",
+         cex.main = 1.2, tl.srt = 45, addCoef.col = "black")
+```
+
+GNI Analysis
+=======================================================================
+
+Column {data-width=600}
+-----------------------------------------------------------------------
+
+```{r, include=FALSE}
+# GOAL: compare CFR based on GNI per capita
+#' There are are pre-existing cut-offs as seen previously; however, due to low sample size
+#' the middle income categories (lower middle and upper middle) will be collapsed into a single
+#' category so that at least 2 countries are included in each bin (low income, middle income, high income)
+income_levels <- c("Low Income", "Middle Income", "High Income")
+d_gni <- d_gni %>% 
+  mutate(gni.category = factor(ifelse(gni.category == "Lower Middle Income", "Middle Income",
+                               ifelse(gni.category == "Upper Middle Income", "Middle Income", gni.category)), levels = income_levels))
+
+
+# use ANOVA to check if any of the three categories have significantly different mean CFRs
+anova_result <- aov(cfr ~ gni.category, data = d_gni)
+```
+
+### ANOVA {data-height=300}
+
+```{r}
+summary(anova_result)
+```
+
+### Tukey Test
+
+```{r}
+# will use Tukey's test to find out which pairs of means are different
+tukey_result <- TukeyHSD(anova_result)
+tukey_result
+```
+
+Column 
+-----------------------------------------------------------------------
+
+```{r, include=FALSE}
+# keep record of significant pairs
+signif_comparisons <- list(c("Low Income", "High Income"), c("Middle Income", "High Income"))
+
+# create boxplot of CFR split by low, middle, and high income 
+boxplot_fig <- ggplot(d_gni, aes(x=gni.category, y=cfr)) +
+  geom_boxplot() +
+  scale_y_continuous(limits = c(0,80)) +
+  labs(x = "GNI Category", y = "Fatalities per 1000 Cases", title = "Comparison of CFR According to GNI Category") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  geom_signif(comparisons = signif_comparisons,
+              annotations = c("*", "*"), 
+              y_position = c(65, 55))
+```
+
+### Box Plot
+
+```{r}
+boxplot_fig
+```
+
+Data Table {data-orientation=rows}
+=======================================================================
+
+Row 
+-----------------------------------------------------------------------
+### COVID-19 Data
+
+```{r}
+# show table of data for the 10 selected countries
+datatable(d, options = list(pageLength = 10))
+```
+
+About
+=======================================================================
+
+**Authors**
+
+Ibrahim Emam, Ahmed Mokhtar, Neha Kodali
+
+**Overview**
+
+This dashboard presents data pertaining to the number of global COVID-19 cases and deaths from 2020 to 2022. The home page includes a map that shows this data for all countries with data available. Of the countries that had data available, 10 were selected and used for downstream analyses. Three socioeconomic indicators were then selected, and correlations between the indicators and COVID-19 data were examined. Of the three indicators, gross national income per capita (GNI) was chosen for statistical analysis. 
+
+**Country Selection**
+
+To select the first three countries, a list of the 10 countries with the highest number of cases per 100K people was obtained. From this list, Austria, France, and Denmark were selected.
+
+To select the next three countries, a list of countries with fewer than 10K cases per 100K people was obtained. From this list, Angola, Chad, and Somalia were selected.
+
+To select the next three countries, a list of the 10 countries with the highest deaths per 100K people was obtained. From this list, Slovenia, Peru, and Qatar were selected.
+
+To select the final three countries, a list of countries with fewer than 250 deaths per 100K people was obtained. From this list, Austria, France, and Croatia were selected.
+
+Thus, since two of the selected countries overlap, 10 unique countries were included in our dashboard:
+
+* Austria
+* France
+* Denmark
+* Angola
+* Chad
+* Somalia
+* Slovenia
+* Peru
+* Qatar
+* Croatia
+
+**Socioeconomic Indicators**
+
+Three socioeconomic indicators were selected: Universal Health Coverage Index (UHC), Gross National Income per capita (GNI), and Population Density (PD). UHC measures access to healthcare services. The index is scored from 0 to 100, with higher scores representing favourable healthcare coverage. The World Bank does not have pre-established guidelines for categorizing UHC scores. 
+
+GNI is the total income earned within a country (USD) divided by the population, though some adjustments are made to account for varying exchange rates over time. GNI was categorized according to the World Bank cut-offs:
+
+* GNI of 0 to 1145 is considered low income
+* GNI of 1146 to 4515 is considered lower middle income
+* GNI of 4516 to 14005 is considered upper middle income
+* GNI of 14006 or more is considered high income.
+
+PD measures the average number of people in a square kilometer for a given region. While the World Bank does not have pre-established guidelines for categorizing PD, the following threasholds were used:
+
+* A PD below 50 is considered low density
+* A PD between 50 and 149 is considered moderate density
+* A PD of 150 to 299 is considered high density
+* A PD of 300 or more is considered very high density.
+
+A correlation plot was created to determine the strength of correlation between the socioeconomic indicators and the COVID-19 epidemiological indicators. The primary interest was to identify which of the three socioeconomic indicators has the strongest correlation with case fatality rate (CFR). The correlation plot indicated that GNI had the strongest correlation with CFR, with a correlation coefficient of -0.78. Therefore, GNI was selected for further analysis. Interestingly, all three indicators have a positive correlation with the number of cases; however, we suspect this is due to higher rates of COVID-19 testing and more accurate reporting in countries with more resources and better access to healthcare.
+
+**GNI Analysis**
+
+To ensure that there were enough countries in each GNI category, the “lower middle income” and “upper middle income” categories were collapsed into a single category. Analysis of Variance (ANOVA) was conducted to determine if any pairs of categories had significantly different mean CFR. The ANOVA yielded a p-value below our chosen significance level of 0.05. This indicates that at least one pair of the categories have significantly different mean CFRs. Tukey’s test was used to determine which of the pairs were significantly different. The obtained p-values indicated that the mean CFR was significantly different between low income and high income countries. Additionally, the mean CFR was significantly different between middle income and high income countries. No other pairings were significantly different. These results indicate an association between GNI and CFR.
+
+**Assumptions**
+
+Our results assume that all countries have accurate testing and reporting of COVID-19 cases and deaths. In reality, this is unlikely to be true. Additionally, ANOVA assumes that the data is normally distributed and there is equal variance within groups.
+
+**Data Sources**
+
+Data pertaining to cases and deaths was obtained from the World Health Organization (WHO). Data pertaining to population, GNI, PD, and UHC were obtained from the World Bank.
+
+**Abbreviations**
+
+* CFR – Case Fatality Rate (per 1000 cases)
+* GNI – Gross National Income per Capita
+* PD – Population Density
+* UHC – Universal Health Coverage Index
+* USD – United States Dollar
+* WHO – World Health Organization
+
+**References**
+
+* Indicators. World Bank Open Data. (n.d.). https://data.worldbank.org/indicator 
+* Moraga, P. (2019). Building a dashboard to visualize spatial data with flexdashboard. essay. 
+* World Health Organization. (n.d.). Covid-19 cases | WHO COVID-19 Dashboard. World Health Organization. https://data.who.int/dashboards/covid19/cases?n=c
+
